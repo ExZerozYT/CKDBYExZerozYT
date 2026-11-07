@@ -1,6 +1,6 @@
 -- ============================================================================
--- CKD Smart Cluster Slot Macro + Auto Pick Wish (ลำดับบัพกำหนดเองได้)
--- UI: Cartoon style ตาม mockup (ส่วน logic เดิมไม่ได้แก้ไข)
+-- x2Shift Hub: Smart Cluster Slot Macro + Auto Pick Wish + Auto Challenge Train
+-- Theme: Eternal Love
 -- ============================================================================
 local Players = game:GetService("Players")
 local VirtualUser = game:GetService("VirtualUser")
@@ -24,6 +24,7 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 30) or LocalPlayer:FindF
 assert(PlayerGui, "Failed to load PlayerGui")
 
 local CONFIG_FILE_NAME = "CKD_SlotLogic_settings.json"
+local TRAIN_SAVE_FILE = "CandyTD_AutoTrain_State.json"
 
 -- ป้องกันรันซ้อน
 if _G.CKD_SlotMacro_Running then
@@ -119,6 +120,7 @@ local DefaultSettings = {
     AutoReplay = false,
     AutoReturnHub = false,
     WishAutoPick = true,
+    AutoChallengeTrain = false,
     WishOrder = DefaultWishOrder(),
     Slots = {
         [1] = { TargetCount = 0, TargetLevel = 0 },
@@ -264,10 +266,110 @@ local function GetPlacedTowers(gc)
 end
 
 local function GetReliableSpot(gc, unitKind)
-    if gc.goodSpot then
+    -- ดึง MatchPath และ state จาก upvalues ของ goodSpot หรือ gc
+    local state = nil
+    local findSpot = nil
+    local matchPathModule = nil
+
+    if gc and gc.goodSpot then
+        local u = debug.getupvalues(gc.goodSpot)
+        if u then
+            state = u[1]
+            findSpot = u[3]
+        end
+    end
+
+    if findSpot then
+        local fu = debug.getupvalues(findSpot)
+        if fu and fu[1] and type(fu[1]) == "table" and fu[1].canPlace then
+            matchPathModule = fu[1]
+        end
+    end
+
+    -- หา footprint / radius ของตัวละคร (เช่น Pepperminteppi, SweetP, YoungBilly หรือตัวละครใหม่ๆ ในอนาคต)
+    local footprint = 3
+    if matchPathModule and matchPathModule.FOOTPRINT and unitKind and matchPathModule.FOOTPRINT[unitKind] then
+        footprint = matchPathModule.FOOTPRINT[unitKind]
+    elseif matchPathModule and matchPathModule.PLACE_RADIUS then
+        footprint = matchPathModule.PLACE_RADIUS
+    end
+
+    -- 1. ถ้าขนาดปกติ (<= 3.5) ให้ลองใช้ gc.goodSpot เดิมก่อน
+    if footprint <= 3.5 and gc and gc.goodSpot then
         local base = gc.goodSpot(unitKind)
         if base then return base end
     end
+
+    -- 2. ระบบค้นหาตำแหน่งที่รองรับทุกขนาด footprint (รวมถึงตัวละครใหม่/ตัวใหญ่) ไม่ว่าจะกี่อัปเดต
+    if matchPathModule and state and state.map then
+        local canPlace = matchPathModule.canPlace
+        local map = state.map
+        local mapTarget = map.layout or map
+        local towers = state.towers
+        local layout = map and map.layout
+        local groundY = matchPathModule.GROUND_WORLD or 0.08333333333333333
+        local currentCam = workspace.CurrentCamera
+        local W = matchPathModule.W or 0.3333333333333333
+
+        -- วิธีที่ 2.1: ค้นหาบริเวณมุมกล้องและรอบตัวผู้เล่นตามแนวสายตาโดยใช้ขนาด footprint จริงของตัวละคร
+        local char = LocalPlayer and LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp and currentCam then
+            local look = currentCam.CFrame.LookVector
+            local v1 = Vector3.new(look.X, 0, look.Z)
+            if v1.Magnitude >= 0.2 then
+                local unitVec = v1.Unit
+                local sideVec = Vector3.new(-unitVec.Z, 0, unitVec.X)
+                local basePos = Vector3.new(hrp.Position.X, groundY, hrp.Position.Z)
+
+                for distForward = 2, 40, 2 do
+                    for distSide = -30, 30, 2 do
+                        local cand = basePos + (unitVec * distForward) + (sideVec * distSide)
+                        local ok, can = pcall(function()
+                            return canPlace(mapTarget, cand, towers, footprint)
+                        end)
+                        if ok and can then
+                            return cand
+                        end
+                    end
+                end
+            end
+        end
+
+        -- วิธีที่ 2.2: หากรอบตัวผู้เล่นเต็ม ให้ค้นหาตามแนวเส้นทางของแมพ (Map Path Points แปลงพิกัดด้วย W ให้เป็น World Coordinate)
+        local pts = (layout and layout.designPath and layout.designPath.pts) or (map.path and map.path.pts)
+        if pts and #pts > 0 then
+            for i = 1, #pts, 2 do
+                local pt = pts[i]
+                local worldPt = Vector3.new(pt.X * W, groundY, pt.Z * W)
+                for _, mult in ipairs({1.0, 1.4, 1.8, 2.2}) do
+                    local dist = (footprint + (7 * mult)) * W
+                    local offsets = {
+                        Vector3.new(0, 0, dist), Vector3.new(0, 0, -dist),
+                        Vector3.new(dist, 0, 0), Vector3.new(-dist, 0, 0),
+                        Vector3.new(dist * 0.7, 0, dist * 0.7), Vector3.new(-dist * 0.7, 0, -dist * 0.7),
+                        Vector3.new(dist * 0.7, 0, -dist * 0.7), Vector3.new(-dist * 0.7, 0, dist * 0.7),
+                    }
+                    for _, off in ipairs(offsets) do
+                        local cand = worldPt + off
+                        local ok, can = pcall(function()
+                            return canPlace(mapTarget, cand, towers, footprint)
+                        end)
+                        if ok and can then
+                            return cand
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- แผนสำรองสุดท้าย
+    if gc and gc.goodSpot then
+        local base = gc.goodSpot(unitKind)
+        if base then return base end
+    end
+
     return nil
 end
 
@@ -290,7 +392,6 @@ local function getCardPriority(card)
         return GetWishScore(perkId)
     end
 
-    -- ตรวจจับจากชื่อบัพที่แสดงอยู่ในการ์ด
     for _, d in ipairs(card:GetDescendants()) do
         if d:IsA("TextLabel") and d.Text ~= "" then
             local text = d.Text:lower()
@@ -378,28 +479,27 @@ local function checkAndPickWish()
 end
 
 -- ============================================================================
--- 2. GUI Interface (Cartoon style ตาม mockup)
+-- 2. GUI Interface (Eternal Love theme)
 -- ============================================================================
 local COLORS = {
-    sky = Color3.fromRGB(127, 180, 224),
-    brown = Color3.fromRGB(91, 58, 36),
-    sidebar = Color3.fromRGB(168, 106, 67),
-    sidebarText = Color3.fromRGB(251, 233, 214),
-    sidebarMuted = Color3.fromRGB(243, 217, 191),
-    sidebarFooter = Color3.fromRGB(143, 87, 54),
-    cream = Color3.fromRGB(251, 241, 223),
+    header = Color3.fromRGB(247, 168, 192),
+    border = Color3.fromRGB(142, 59, 92),
+    body = Color3.fromRGB(255, 240, 244),
+    sidebar = Color3.fromRGB(247, 182, 201),
+    sidebarFooter = Color3.fromRGB(255, 255, 255),
+    sidebarText = Color3.fromRGB(255, 255, 255),
+    sidebarMuted = Color3.fromRGB(142, 59, 92),
     white = Color3.fromRGB(255, 255, 255),
-    field = Color3.fromRGB(251, 241, 223),
-    text = Color3.fromRGB(59, 37, 22),
-    muted = Color3.fromRGB(138, 106, 82),
-    yellow = Color3.fromRGB(242, 197, 61),
-    red = Color3.fromRGB(224, 70, 58),
-    green = Color3.fromRGB(123, 201, 111),
-    off = Color3.fromRGB(217, 195, 173),
-    statusBg = Color3.fromRGB(206, 232, 250),
-    statusDefault = Color3.fromRGB(12, 68, 124),
-    statusWait = Color3.fromRGB(184, 110, 16),
-    statusDone = Color3.fromRGB(59, 120, 40),
+    pinkSoft = Color3.fromRGB(255, 224, 234),
+    field = Color3.fromRGB(255, 240, 244),
+    text = Color3.fromRGB(90, 42, 64),
+    muted = Color3.fromRGB(176, 106, 133),
+    accent = Color3.fromRGB(224, 82, 122),
+    accentSoft = Color3.fromRGB(247, 168, 192),
+    offTrack = Color3.fromRGB(243, 210, 221),
+    statusDefault = Color3.fromRGB(142, 59, 92),
+    statusWait = Color3.fromRGB(176, 90, 40),
+    statusDone = Color3.fromRGB(60, 130, 90),
 }
 
 local function MakeCorner(parent, radius)
@@ -429,12 +529,12 @@ local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
 MainFrame.Size = UDim2.new(0, WIN_W, 0, WIN_H)
 MainFrame.Position = UDim2.new(0.02, 0, 0.20, 0)
-MainFrame.BackgroundColor3 = COLORS.cream
+MainFrame.BackgroundColor3 = COLORS.body
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
 MainFrame.Parent = ScreenGui
-MakeCorner(MainFrame, 14)
-MakeStroke(MainFrame, COLORS.brown, 3)
+MakeCorner(MainFrame, 16)
+MakeStroke(MainFrame, COLORS.border, 3)
 
 -- Draggable
 do
@@ -467,32 +567,32 @@ end
 -- Title bar
 local TitleBar = Instance.new("Frame")
 TitleBar.Size = UDim2.new(1, 0, 0, TITLE_H)
-TitleBar.BackgroundColor3 = COLORS.sky
+TitleBar.BackgroundColor3 = COLORS.header
 TitleBar.BorderSizePixel = 0
 TitleBar.Parent = MainFrame
-MakeStroke(TitleBar, COLORS.brown, 3)
+MakeStroke(TitleBar, COLORS.border, 3)
 
 local Logo = Instance.new("TextLabel")
-Logo.Size = UDim2.new(0, 32, 0, 32)
-Logo.Position = UDim2.new(0, 12, 0.5, -16)
-Logo.BackgroundColor3 = COLORS.red
-Logo.Text = "C"
-Logo.TextColor3 = COLORS.white
+Logo.Size = UDim2.new(0, 34, 0, 34)
+Logo.Position = UDim2.new(0, 12, 0.5, -17)
+Logo.BackgroundColor3 = COLORS.white
+Logo.Text = "x2"
+Logo.TextColor3 = COLORS.accent
 Logo.Font = Enum.Font.GothamBold
-Logo.TextSize = 14
+Logo.TextSize = 12
 Logo.Parent = TitleBar
-MakeCorner(Logo, 16)
-MakeStroke(Logo, COLORS.white, 2)
+MakeCorner(Logo, 17)
+MakeStroke(Logo, COLORS.border, 2)
 
 local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Text = "Candy Macro"
+TitleLabel.Text = "x2Shift Hub"
 TitleLabel.TextColor3 = COLORS.white
 TitleLabel.Font = Enum.Font.GothamBold
 TitleLabel.TextSize = 18
-TitleLabel.TextStrokeColor3 = COLORS.brown
+TitleLabel.TextStrokeColor3 = COLORS.border
 TitleLabel.TextStrokeTransparency = 0
 TitleLabel.Size = UDim2.new(0, 200, 1, 0)
-TitleLabel.Position = UDim2.new(0, 54, 0, 0)
+TitleLabel.Position = UDim2.new(0, 56, 0, 0)
 TitleLabel.BackgroundTransparency = 1
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 TitleLabel.Parent = TitleBar
@@ -501,25 +601,25 @@ local CloseBtn = Instance.new("TextButton")
 CloseBtn.Text = "X"
 CloseBtn.Size = UDim2.new(0, 30, 0, 30)
 CloseBtn.Position = UDim2.new(1, -42, 0.5, -15)
-CloseBtn.BackgroundColor3 = COLORS.red
+CloseBtn.BackgroundColor3 = COLORS.accent
 CloseBtn.TextColor3 = COLORS.white
 CloseBtn.Font = Enum.Font.GothamBold
 CloseBtn.TextSize = 14
 CloseBtn.Parent = TitleBar
-MakeCorner(CloseBtn, 8)
-MakeStroke(CloseBtn, COLORS.brown, 2)
+MakeCorner(CloseBtn, 9)
+MakeStroke(CloseBtn, COLORS.border, 2)
 
 local MinBtn = Instance.new("TextButton")
 MinBtn.Text = "-"
 MinBtn.Size = UDim2.new(0, 30, 0, 30)
 MinBtn.Position = UDim2.new(1, -80, 0.5, -15)
-MinBtn.BackgroundColor3 = COLORS.yellow
-MinBtn.TextColor3 = COLORS.brown
+MinBtn.BackgroundColor3 = COLORS.pinkSoft
+MinBtn.TextColor3 = COLORS.border
 MinBtn.Font = Enum.Font.GothamBold
 MinBtn.TextSize = 16
 MinBtn.Parent = TitleBar
-MakeCorner(MinBtn, 8)
-MakeStroke(MinBtn, COLORS.brown, 2)
+MakeCorner(MinBtn, 9)
+MakeStroke(MinBtn, COLORS.border, 2)
 
 CloseBtn.MouseButton1Click:Connect(function()
     _G.CKD_SlotMacro_Running = false
@@ -542,7 +642,7 @@ Sidebar.Position = UDim2.new(0, 0, 0, TITLE_H)
 Sidebar.BackgroundColor3 = COLORS.sidebar
 Sidebar.BorderSizePixel = 0
 Sidebar.Parent = MainFrame
-MakeStroke(Sidebar, COLORS.brown, 2)
+MakeStroke(Sidebar, COLORS.border, 2)
 
 local SidebarLayout = Instance.new("UIListLayout")
 SidebarLayout.Padding = UDim.new(0, 6)
@@ -585,7 +685,7 @@ local function ShowPage(name)
     end
     for tabName, btn in pairs(TabButtons) do
         local active = (tabName == name)
-        btn.BackgroundColor3 = active and COLORS.cream or COLORS.sidebar
+        btn.BackgroundColor3 = active and COLORS.white or COLORS.sidebar
         btn.TextColor3 = active and COLORS.text or COLORS.sidebarText
         local stroke = btn:FindFirstChildOfClass("UIStroke")
         if stroke then
@@ -606,11 +706,11 @@ local function MakeTab(name, order)
     btn.AutoButtonColor = false
     btn.LayoutOrder = order
     btn.Parent = Sidebar
-    MakeCorner(btn, 10)
+    MakeCorner(btn, 12)
     local tp = Instance.new("UIPadding")
     tp.PaddingLeft = UDim.new(0, 12)
     tp.Parent = btn
-    local s = MakeStroke(btn, COLORS.brown, 2)
+    local s = MakeStroke(btn, COLORS.border, 2)
     s.Enabled = false
     btn.MouseButton1Click:Connect(function()
         ShowPage(name)
@@ -624,7 +724,7 @@ local function MakePage(name)
     page.BackgroundTransparency = 1
     page.BorderSizePixel = 0
     page.ScrollBarThickness = 4
-    page.ScrollBarImageColor3 = COLORS.brown
+    page.ScrollBarImageColor3 = COLORS.border
     page.CanvasSize = UDim2.new(0, 0, 0, 0)
     page.AutomaticCanvasSize = Enum.AutomaticSize.Y
     page.Visible = false
@@ -651,20 +751,21 @@ MakeTab("Dashboard", 2)
 MakeSection("ตั้งค่า", 3)
 MakeTab("Slots", 4)
 MakeTab("Wish priority", 5)
+MakeTab("Dungeon", 6)
 
 local footer = Instance.new("Frame")
 footer.Size = UDim2.new(1, 0, 0, 30)
 footer.BackgroundColor3 = COLORS.sidebarFooter
 footer.LayoutOrder = 20
 footer.Parent = Sidebar
-MakeCorner(footer, 10)
-MakeStroke(footer, COLORS.brown, 2)
+MakeCorner(footer, 12)
+MakeStroke(footer, COLORS.border, 2)
 
 local footerLabel = Instance.new("TextLabel")
 footerLabel.Size = UDim2.new(1, 0, 1, 0)
 footerLabel.BackgroundTransparency = 1
-footerLabel.Text = "เวอร์ชัน 1.0"
-footerLabel.TextColor3 = COLORS.sidebarText
+footerLabel.Text = "Eternal Love · v1.0"
+footerLabel.TextColor3 = COLORS.border
 footerLabel.Font = Enum.Font.GothamMedium
 footerLabel.TextSize = 10
 footerLabel.Parent = footer
@@ -672,14 +773,15 @@ footerLabel.Parent = footer
 local DashPage = MakePage("Dashboard")
 local SlotsPage = MakePage("Slots")
 local WishPage = MakePage("Wish priority")
+local DungeonPage = MakePage("Dungeon")
 
 -- ============================================================================
 -- Switch row (ปกติ และแบบ compact สำหรับตารางระบบอัตโนมัติ)
 -- ============================================================================
 local function MakeSwitchRow(parent, labelText, onColor, getState, onToggle, order, compact)
-    local trackW = compact and 34 or 44
-    local trackH = compact and 19 or 24
-    local knobSize = compact and 13 or 18
+    local trackW = compact and 34 or 46
+    local trackH = compact and 19 or 26
+    local knobSize = compact and 13 or 20
     local pad = 2
 
     local row = Instance.new("TextButton")
@@ -689,8 +791,8 @@ local function MakeSwitchRow(parent, labelText, onColor, getState, onToggle, ord
     row.Text = ""
     row.LayoutOrder = order
     row.Parent = parent
-    MakeCorner(row, 12)
-    MakeStroke(row, COLORS.brown, 2)
+    MakeCorner(row, 14)
+    MakeStroke(row, COLORS.border, 2)
 
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1, -(trackW + 22), 1, 0)
@@ -711,7 +813,7 @@ local function MakeSwitchRow(parent, labelText, onColor, getState, onToggle, ord
     track.BorderSizePixel = 0
     track.Parent = row
     MakeCorner(track, trackH / 2)
-    MakeStroke(track, COLORS.brown, 2)
+    MakeStroke(track, COLORS.border, 2)
 
     local knob = Instance.new("Frame")
     knob.Size = UDim2.new(0, knobSize, 0, knobSize)
@@ -723,7 +825,7 @@ local function MakeSwitchRow(parent, labelText, onColor, getState, onToggle, ord
 
     local function render(animate)
         local on = getState()
-        local color = on and onColor or COLORS.off
+        local color = on and onColor or COLORS.offTrack
         local pos = on and UDim2.new(0, trackW - knobSize - pad, 0.5, 0) or UDim2.new(0, pad, 0.5, 0)
         if animate then
             TweenService:Create(track, TweenInfo.new(0.15), { BackgroundColor3 = color }):Play()
@@ -748,7 +850,7 @@ local function MakeLabel(parent, text, order)
     l.Size = UDim2.new(1, 0, 0, 16)
     l.BackgroundTransparency = 1
     l.Text = text
-    l.TextColor3 = COLORS.muted
+    l.TextColor3 = COLORS.border
     l.Font = Enum.Font.GothamMedium
     l.TextSize = 11
     l.TextXAlignment = Enum.TextXAlignment.Left
@@ -778,8 +880,8 @@ local function MakeStatTile(caption, initial, order)
     tile.BackgroundColor3 = COLORS.white
     tile.LayoutOrder = order
     tile.Parent = StatsRow
-    MakeCorner(tile, 12)
-    MakeStroke(tile, COLORS.brown, 2)
+    MakeCorner(tile, 14)
+    MakeStroke(tile, COLORS.border, 2)
 
     local cap = Instance.new("TextLabel")
     cap.Size = UDim2.new(1, -20, 0, 14)
@@ -813,25 +915,25 @@ local PickedValue = MakeStatTile("บัพที่เลือก", "0", 3)
 -- การ์ดสถานะพร้อมแถบความคืบหน้า
 local ProgressCard = Instance.new("Frame")
 ProgressCard.Size = UDim2.new(1, 0, 0, 62)
-ProgressCard.BackgroundColor3 = COLORS.statusBg
+ProgressCard.BackgroundColor3 = COLORS.pinkSoft
 ProgressCard.LayoutOrder = 2
 ProgressCard.Parent = DashPage
-MakeCorner(ProgressCard, 12)
-MakeStroke(ProgressCard, COLORS.brown, 2)
+MakeCorner(ProgressCard, 14)
+MakeStroke(ProgressCard, COLORS.border, 2)
 
 local PlayBox = Instance.new("Frame")
 PlayBox.Size = UDim2.new(0, 38, 0, 38)
 PlayBox.Position = UDim2.new(0, 12, 0.5, -19)
-PlayBox.BackgroundColor3 = COLORS.green
+PlayBox.BackgroundColor3 = COLORS.accent
 PlayBox.Parent = ProgressCard
-MakeCorner(PlayBox, 10)
-MakeStroke(PlayBox, COLORS.brown, 2)
+MakeCorner(PlayBox, 12)
+MakeStroke(PlayBox, COLORS.border, 2)
 
 local PlayText = Instance.new("TextLabel")
 PlayText.Size = UDim2.new(1, 0, 1, 0)
 PlayText.BackgroundTransparency = 1
 PlayText.Text = ">"
-PlayText.TextColor3 = COLORS.brown
+PlayText.TextColor3 = COLORS.white
 PlayText.Font = Enum.Font.GothamBold
 PlayText.TextSize = 18
 PlayText.Parent = PlayBox
@@ -853,7 +955,7 @@ ProgressCount.Size = UDim2.new(0, 80, 0, 18)
 ProgressCount.Position = UDim2.new(1, -92, 0, 8)
 ProgressCount.BackgroundTransparency = 1
 ProgressCount.Text = "0 / 0"
-ProgressCount.TextColor3 = COLORS.statusDefault
+ProgressCount.TextColor3 = COLORS.accent
 ProgressCount.Font = Enum.Font.GothamMedium
 ProgressCount.TextSize = 11
 ProgressCount.TextXAlignment = Enum.TextXAlignment.Right
@@ -865,12 +967,12 @@ ProgressBack.Position = UDim2.new(0, 62, 0, 36)
 ProgressBack.BackgroundColor3 = COLORS.white
 ProgressBack.ClipsDescendants = true
 ProgressBack.Parent = ProgressCard
-MakeCorner(ProgressBack, 5)
-MakeStroke(ProgressBack, COLORS.brown, 1.5)
+MakeCorner(ProgressBack, 6)
+MakeStroke(ProgressBack, COLORS.border, 1.5)
 
 local ProgressFill = Instance.new("Frame")
 ProgressFill.Size = UDim2.new(0, 0, 1, 0)
-ProgressFill.BackgroundColor3 = COLORS.green
+ProgressFill.BackgroundColor3 = COLORS.accent
 ProgressFill.BorderSizePixel = 0
 ProgressFill.Parent = ProgressBack
 
@@ -883,7 +985,7 @@ local function SetProgress(placed, total)
     ProgressCount.Text = string.format("%d / %d", placed, total)
 end
 
-MakeSwitchRow(DashPage, "สวิตช์หลัก", COLORS.green, function()
+MakeSwitchRow(DashPage, "สวิตช์หลัก", COLORS.accent, function()
     return Settings.MasterSwitch
 end, function()
     Settings.MasterSwitch = not Settings.MasterSwitch
@@ -904,28 +1006,28 @@ AutoGridLayout.CellPadding = UDim2.new(0, 8, 0, 8)
 AutoGridLayout.SortOrder = Enum.SortOrder.LayoutOrder
 AutoGridLayout.Parent = AutoGrid
 
-MakeSwitchRow(AutoGrid, "เริ่มเวฟอัตโนมัติ", COLORS.green, function()
+MakeSwitchRow(AutoGrid, "เริ่มเวฟอัตโนมัติ", COLORS.accent, function()
     return Settings.AutoStartWave
 end, function()
     Settings.AutoStartWave = not Settings.AutoStartWave
     SaveSettings()
 end, 1, true)
 
-MakeSwitchRow(AutoGrid, "ใช้สกิลอัตโนมัติ", COLORS.green, function()
+MakeSwitchRow(AutoGrid, "ใช้สกิลอัตโนมัติ", COLORS.accent, function()
     return Settings.AutoAbility
 end, function()
     Settings.AutoAbility = not Settings.AutoAbility
     SaveSettings()
 end, 2, true)
 
-MakeSwitchRow(AutoGrid, "เล่นต่ออัตโนมัติ", COLORS.green, function()
+MakeSwitchRow(AutoGrid, "เล่นต่ออัตโนมัติ", COLORS.accent, function()
     return Settings.AutoReplay
 end, function()
     Settings.AutoReplay = not Settings.AutoReplay
     SaveSettings()
 end, 3, true)
 
-MakeSwitchRow(AutoGrid, "กลับ Hub", COLORS.green, function()
+MakeSwitchRow(AutoGrid, "กลับ Hub", COLORS.accent, function()
     return Settings.AutoReturnHub
 end, function()
     Settings.AutoReturnHub = not Settings.AutoReturnHub
@@ -940,8 +1042,8 @@ WishSummaryBox.Size = UDim2.new(1, 0, 0, 108)
 WishSummaryBox.BackgroundColor3 = COLORS.white
 WishSummaryBox.LayoutOrder = 7
 WishSummaryBox.Parent = DashPage
-MakeCorner(WishSummaryBox, 12)
-MakeStroke(WishSummaryBox, COLORS.brown, 2)
+MakeCorner(WishSummaryBox, 14)
+MakeStroke(WishSummaryBox, COLORS.border, 2)
 
 local SummaryPad = Instance.new("UIPadding")
 SummaryPad.PaddingLeft = UDim.new(0, 10)
@@ -966,13 +1068,13 @@ for i = 1, 3 do
     local badge = Instance.new("TextLabel")
     badge.Size = UDim2.new(0, 20, 0, 20)
     badge.Position = UDim2.new(0, 0, 0.5, -10)
-    badge.BackgroundColor3 = COLORS.yellow
+    badge.BackgroundColor3 = COLORS.accentSoft
     badge.Text = tostring(i)
-    badge.TextColor3 = COLORS.brown
+    badge.TextColor3 = COLORS.text
     badge.Font = Enum.Font.GothamBold
     badge.TextSize = 11
     badge.Parent = r
-    MakeCorner(badge, 6)
+    MakeCorner(badge, 7)
 
     local nameLbl = Instance.new("TextLabel")
     nameLbl.Size = UDim2.new(1, -140, 1, 0)
@@ -1005,8 +1107,8 @@ local function RefreshWishSummary()
         local key = Settings.WishOrder[i]
         local item = key and WishByKey[key]
         if item and r then
-            r.Badge.BackgroundColor3 = (i == 1) and COLORS.red or COLORS.yellow
-            r.Badge.TextColor3 = (i == 1) and COLORS.white or COLORS.brown
+            r.Badge.BackgroundColor3 = (i == 1) and COLORS.accent or COLORS.accentSoft
+            r.Badge.TextColor3 = (i == 1) and COLORS.white or COLORS.text
             r.Name.Text = item.name
             r.Desc.Text = item.desc
         end
@@ -1067,32 +1169,32 @@ local function MakeMiniGroup(parent, xOffset)
     box.Position = UDim2.new(0, xOffset, 0, 0)
     box.BackgroundColor3 = COLORS.field
     box.Parent = parent
-    MakeCorner(box, 8)
-    MakeStroke(box, COLORS.brown, 1.5)
+    MakeCorner(box, 10)
+    MakeStroke(box, COLORS.border, 1.5)
 
     local minus = Instance.new("TextButton")
     minus.Size = UDim2.new(0, 22, 0, 20)
     minus.Position = UDim2.new(0, 3, 0.5, -10)
-    minus.BackgroundColor3 = COLORS.yellow
+    minus.BackgroundColor3 = COLORS.accentSoft
     minus.Text = "-"
-    minus.TextColor3 = COLORS.brown
+    minus.TextColor3 = COLORS.text
     minus.Font = Enum.Font.GothamBold
     minus.TextSize = 13
     minus.Parent = box
-    MakeCorner(minus, 6)
-    MakeStroke(minus, COLORS.brown, 1.5)
+    MakeCorner(minus, 7)
+    MakeStroke(minus, COLORS.border, 1.5)
 
     local plus = Instance.new("TextButton")
     plus.Size = UDim2.new(0, 22, 0, 20)
     plus.Position = UDim2.new(1, -25, 0.5, -10)
-    plus.BackgroundColor3 = COLORS.green
+    plus.BackgroundColor3 = COLORS.accent
     plus.Text = "+"
-    plus.TextColor3 = COLORS.brown
+    plus.TextColor3 = COLORS.white
     plus.Font = Enum.Font.GothamBold
     plus.TextSize = 13
     plus.Parent = box
-    MakeCorner(plus, 6)
-    MakeStroke(plus, COLORS.brown, 1.5)
+    MakeCorner(plus, 7)
+    MakeStroke(plus, COLORS.border, 1.5)
 
     local value = Instance.new("TextLabel")
     value.Size = UDim2.new(0, 36, 1, 0)
@@ -1117,8 +1219,8 @@ for slotIdx = 1, 6 do
     Card.BackgroundColor3 = COLORS.white
     Card.LayoutOrder = slotIdx
     Card.Parent = SlotsPage
-    MakeCorner(Card, 10)
-    MakeStroke(Card, COLORS.brown, 2)
+    MakeCorner(Card, 14)
+    MakeStroke(Card, COLORS.border, 2)
 
     local SlotTitle = Instance.new("TextLabel")
     SlotTitle.Size = UDim2.new(1, -200, 0, 16)
@@ -1227,7 +1329,7 @@ WishHint.TextXAlignment = Enum.TextXAlignment.Left
 WishHint.LayoutOrder = 2
 WishHint.Parent = WishPage
 
-MakeSwitchRow(WishPage, "Auto pick wish", COLORS.green, function()
+MakeSwitchRow(WishPage, "Auto pick wish", COLORS.accent, function()
     return Settings.WishAutoPick
 end, function()
     Settings.WishAutoPick = not Settings.WishAutoPick
@@ -1236,15 +1338,15 @@ end, 3)
 
 local ResetWishBtn = Instance.new("TextButton")
 ResetWishBtn.Size = UDim2.new(1, 0, 0, 30)
-ResetWishBtn.BackgroundColor3 = COLORS.yellow
+ResetWishBtn.BackgroundColor3 = COLORS.accentSoft
 ResetWishBtn.Text = "Reset to default order"
-ResetWishBtn.TextColor3 = COLORS.brown
+ResetWishBtn.TextColor3 = COLORS.text
 ResetWishBtn.Font = Enum.Font.GothamBold
 ResetWishBtn.TextSize = 12
 ResetWishBtn.LayoutOrder = 4
 ResetWishBtn.Parent = WishPage
-MakeCorner(ResetWishBtn, 10)
-MakeStroke(ResetWishBtn, COLORS.brown, 2)
+MakeCorner(ResetWishBtn, 12)
+MakeStroke(ResetWishBtn, COLORS.border, 2)
 
 local RebuildWishList
 
@@ -1257,19 +1359,19 @@ local function BuildWishRow(rank, item)
     row.BackgroundColor3 = COLORS.white
     row.LayoutOrder = 10 + rank
     row.Parent = WishPage
-    MakeCorner(row, 10)
-    MakeStroke(row, rank == 1 and COLORS.red or COLORS.brown, 2)
+    MakeCorner(row, 12)
+    MakeStroke(row, rank == 1 and COLORS.accent or COLORS.border, 2)
 
     local badge = Instance.new("TextLabel")
     badge.Size = UDim2.new(0, 26, 0, 26)
     badge.Position = UDim2.new(0, 10, 0.5, -13)
-    badge.BackgroundColor3 = rank == 1 and COLORS.red or (rank <= 10 and COLORS.yellow or COLORS.sky)
+    badge.BackgroundColor3 = rank == 1 and COLORS.accent or (rank <= 10 and COLORS.accentSoft or COLORS.pinkSoft)
     badge.Text = tostring(rank)
-    badge.TextColor3 = rank == 1 and COLORS.white or COLORS.brown
+    badge.TextColor3 = rank == 1 and COLORS.white or COLORS.text
     badge.Font = Enum.Font.GothamBold
     badge.TextSize = 12
     badge.Parent = row
-    MakeCorner(badge, 7)
+    MakeCorner(badge, 8)
 
     local nameLabel = Instance.new("TextLabel")
     nameLabel.Size = UDim2.new(1, -150, 0, 18)
@@ -1298,26 +1400,26 @@ local function BuildWishRow(rank, item)
     local upBtn = Instance.new("TextButton")
     upBtn.Size = UDim2.new(0, 42, 0, 20)
     upBtn.Position = UDim2.new(1, -52, 0, 7)
-    upBtn.BackgroundColor3 = rank > 1 and COLORS.yellow or COLORS.off
+    upBtn.BackgroundColor3 = rank > 1 and COLORS.accentSoft or COLORS.offTrack
     upBtn.Text = "Up"
-    upBtn.TextColor3 = COLORS.brown
+    upBtn.TextColor3 = COLORS.text
     upBtn.Font = Enum.Font.GothamBold
     upBtn.TextSize = 10
     upBtn.Parent = row
-    MakeCorner(upBtn, 6)
-    MakeStroke(upBtn, COLORS.brown, 1.5)
+    MakeCorner(upBtn, 7)
+    MakeStroke(upBtn, COLORS.border, 1.5)
 
     local downBtn = Instance.new("TextButton")
     downBtn.Size = UDim2.new(0, 42, 0, 20)
     downBtn.Position = UDim2.new(1, -52, 0, 29)
-    downBtn.BackgroundColor3 = rank < total and COLORS.yellow or COLORS.off
+    downBtn.BackgroundColor3 = rank < total and COLORS.accentSoft or COLORS.offTrack
     downBtn.Text = "Down"
-    downBtn.TextColor3 = COLORS.brown
+    downBtn.TextColor3 = COLORS.text
     downBtn.Font = Enum.Font.GothamBold
     downBtn.TextSize = 10
     downBtn.Parent = row
-    MakeCorner(downBtn, 6)
-    MakeStroke(downBtn, COLORS.brown, 1.5)
+    MakeCorner(downBtn, 7)
+    MakeStroke(downBtn, COLORS.border, 1.5)
 
     upBtn.MouseButton1Click:Connect(function()
         if rank > 1 then
@@ -1360,6 +1462,87 @@ ResetWishBtn.MouseButton1Click:Connect(function()
 end)
 
 RebuildWishList()
+
+-- ============================================================================
+-- Dungeon page (Auto challenge train)
+-- ============================================================================
+MakeSwitchRow(DungeonPage, "Auto challenge train", COLORS.accent, function()
+    return Settings.AutoChallengeTrain
+end, function()
+    Settings.AutoChallengeTrain = not Settings.AutoChallengeTrain
+    SaveSettings()
+end, 1)
+
+local TrainCard = Instance.new("Frame")
+TrainCard.Size = UDim2.new(1, 0, 0, 72)
+TrainCard.BackgroundColor3 = COLORS.pinkSoft
+TrainCard.LayoutOrder = 2
+TrainCard.Parent = DungeonPage
+MakeCorner(TrainCard, 14)
+MakeStroke(TrainCard, COLORS.border, 2)
+
+local TrainPeriodLabel = Instance.new("TextLabel")
+TrainPeriodLabel.Size = UDim2.new(1, -20, 0, 18)
+TrainPeriodLabel.Position = UDim2.new(0, 10, 0, 8)
+TrainPeriodLabel.BackgroundTransparency = 1
+TrainPeriodLabel.Text = "รอบ 30 นาทีปัจจุบัน: -"
+TrainPeriodLabel.TextColor3 = COLORS.statusDefault
+TrainPeriodLabel.Font = Enum.Font.GothamMedium
+TrainPeriodLabel.TextSize = 12
+TrainPeriodLabel.TextXAlignment = Enum.TextXAlignment.Left
+TrainPeriodLabel.Parent = TrainCard
+
+local TrainNextLabel = Instance.new("TextLabel")
+TrainNextLabel.Size = UDim2.new(1, -20, 0, 14)
+TrainNextLabel.Position = UDim2.new(0, 10, 0, 24)
+TrainNextLabel.BackgroundTransparency = 1
+TrainNextLabel.Text = "ตู้ถัดไป: -"
+TrainNextLabel.TextColor3 = COLORS.muted
+TrainNextLabel.Font = Enum.Font.Gotham
+TrainNextLabel.TextSize = 11
+TrainNextLabel.TextXAlignment = Enum.TextXAlignment.Left
+TrainNextLabel.Parent = TrainCard
+
+local CarRow = Instance.new("Frame")
+CarRow.Size = UDim2.new(1, -20, 0, 26)
+CarRow.Position = UDim2.new(0, 10, 0, 40)
+CarRow.BackgroundTransparency = 1
+CarRow.Parent = TrainCard
+
+local CarLayout = Instance.new("UIListLayout")
+CarLayout.FillDirection = Enum.FillDirection.Horizontal
+CarLayout.Padding = UDim.new(0, 6)
+CarLayout.SortOrder = Enum.SortOrder.LayoutOrder
+CarLayout.Parent = CarRow
+
+local CarPills = {}
+for i = 1, 3 do
+    local pill = Instance.new("TextLabel")
+    pill.Size = UDim2.new(0.3333, -4, 1, 0)
+    pill.BackgroundColor3 = COLORS.white
+    pill.Text = "ตู้ " .. i
+    pill.TextColor3 = COLORS.muted
+    pill.Font = Enum.Font.GothamMedium
+    pill.TextSize = 11
+    pill.LayoutOrder = i
+    pill.Parent = CarRow
+    MakeCorner(pill, 8)
+    MakeStroke(pill, COLORS.border, 1.5)
+    CarPills[i] = pill
+end
+
+local TrainNote = Instance.new("TextLabel")
+TrainNote.Size = UDim2.new(1, 0, 0, 30)
+TrainNote.BackgroundColor3 = COLORS.white
+TrainNote.Text = "คิวการเล่นจะจำไว้เมื่อปิดเกมและเปิดใหม่ในรอบเดิม"
+TrainNote.TextColor3 = COLORS.muted
+TrainNote.Font = Enum.Font.Gotham
+TrainNote.TextSize = 11
+TrainNote.TextWrapped = true
+TrainNote.LayoutOrder = 3
+TrainNote.Parent = DungeonPage
+MakeCorner(TrainNote, 12)
+MakeStroke(TrainNote, COLORS.border, 1.5)
 
 ShowPage("Dashboard")
 
@@ -1504,7 +1687,7 @@ task.spawn(function()
                         else
                             row.Title.Text = string.format("%d: ว่าง", slotIdx)
                             row.Sub.Text = "ยังไม่มียูนิต"
-                            row.Card.BackgroundColor3 = COLORS.cream
+                            row.Card.BackgroundColor3 = COLORS.pinkSoft
                             row.Steppers.Visible = false
                         end
                     end
@@ -1710,6 +1893,167 @@ task.spawn(function()
 end)
 
 -- ============================================================================
+-- Auto Challenge Train (ทำงานเมื่ออยู่ใน Hub และเปิดสวิตช์ไว้)
+-- ============================================================================
+local targetCars = {1, 2, 3}
+local isTrainProcessing = false
+
+local function loadTrainState()
+    if isfile and isfile(TRAIN_SAVE_FILE) then
+        local readOk, content = pcall(readfile, TRAIN_SAVE_FILE)
+        if readOk and content and #content > 0 then
+            local jsonOk, data = pcall(function()
+                return HttpService:JSONDecode(content)
+            end)
+            if jsonOk and type(data) == "table" then
+                return data
+            end
+        end
+    end
+    return { currentPeriod = 0, nextCarIdx = 1 }
+end
+
+local function saveTrainState(period, nextIdx)
+    if writefile then
+        local data = {
+            currentPeriod = period,
+            nextCarIdx = nextIdx
+        }
+        local encoded = HttpService:JSONEncode(data)
+        pcall(writefile, TRAIN_SAVE_FILE, encoded)
+    end
+end
+
+local function UpdateTrainUI(period, nextIdx)
+    TrainPeriodLabel.Text = string.format("รอบ 30 นาทีปัจจุบัน: %s", tostring(period))
+    TrainNextLabel.Text = string.format("ตู้ถัดไป: %d", targetCars[nextIdx] or 1)
+    for i, pill in ipairs(CarPills) do
+        if i < nextIdx then
+            pill.Text = "ตู้ " .. i .. " เสร็จ"
+            pill.BackgroundColor3 = COLORS.statusDone
+            pill.TextColor3 = COLORS.white
+        elseif i == nextIdx then
+            pill.Text = "ตู้ " .. i .. " ถัดไป"
+            pill.BackgroundColor3 = COLORS.accentSoft
+            pill.TextColor3 = COLORS.text
+        else
+            pill.Text = "ตู้ " .. i
+            pill.BackgroundColor3 = COLORS.white
+            pill.TextColor3 = COLORS.muted
+        end
+    end
+end
+
+local function joinNextChallenge()
+    if isTrainProcessing then return end
+    isTrainProcessing = true
+
+    print("[Auto Train]: Checking place...")
+
+    local HubFolder = ReplicatedStorage:WaitForChild("Hub", 5)
+    local HubRemotes = ReplicatedStorage:WaitForChild("HubRemotes", 5)
+
+    if not HubFolder or not HubRemotes then
+        print("[Auto Train]: Not in Hub / Lobby. Standing by...")
+        isTrainProcessing = false
+        return
+    end
+
+    local CatalogMod = HubFolder:WaitForChild("Catalog", 10)
+    local CreateMatch = HubRemotes:WaitForChild("CreateMatch", 10)
+    local StartMatch = HubRemotes:WaitForChild("StartMatch", 10)
+
+    if not CatalogMod or not CreateMatch or not StartMatch then
+        print("[Auto Train]: Core components not ready. Standing by...")
+        isTrainProcessing = false
+        return
+    end
+
+    task.wait(4.0)
+
+    local Catalog = require(CatalogMod)
+    local serverNow = workspace:GetServerTimeNow()
+
+    local currentPeriod = Catalog.challengePeriod and Catalog.challengePeriod(serverNow) or math.floor(serverNow / 1800)
+    local challenges = Catalog.challengesAt and Catalog.challengesAt(serverNow)
+
+    if not challenges or #challenges == 0 then
+        warn("[Auto Train]: Could not get challenges from Catalog.")
+        isTrainProcessing = false
+        return
+    end
+
+    local state = loadTrainState()
+    local carIdxToPlay = 1
+
+    if state.currentPeriod == currentPeriod then
+        carIdxToPlay = state.nextCarIdx or 1
+        print(string.format("[Auto Train]: Continuing current period (%s) -> Playing CAR %d", tostring(currentPeriod), targetCars[carIdxToPlay]))
+    else
+        print(string.format("[Auto Train]: New 30-min period detected (%s -> %s)! Resetting to CAR 1.", tostring(state.currentPeriod), tostring(currentPeriod)))
+        carIdxToPlay = 1
+    end
+
+    local carNum = targetCars[carIdxToPlay]
+    local targetChallenge = challenges[carNum]
+
+    if not targetChallenge then
+        warn(string.format("[Auto Train]: Data for Car %d not found!", carNum))
+        isTrainProcessing = false
+        return
+    end
+
+    print(string.format("[Auto Train]: Target CAR %d -> Stage: %s, ID: %s", carNum, tostring(targetChallenge.stage), tostring(targetChallenge.id)))
+
+    -- 1. บันทึกคิวของรอบต่อไปลงไฟล์ทันที (วน 1 -> 2 -> 3 -> 1 ...)
+    local nextIdx = (carIdxToPlay % #targetCars) + 1
+    saveTrainState(currentPeriod, nextIdx)
+    UpdateTrainUI(currentPeriod, nextIdx)
+    print(string.format("[Auto Train]: Saved! Next game will target CAR %d.", targetCars[nextIdx]))
+
+    -- 2. สร้างห้อง CreateMatch
+    print(string.format("[Auto Train]: Invoking CreateMatch for CAR %d...", carNum))
+    pcall(function()
+        CreateMatch:InvokeServer(targetChallenge.stage, targetChallenge.id, true)
+    end)
+
+    task.wait(2.0)
+
+    -- 3. เริ่มเกม StartMatch
+    print("[Auto Train]: Invoking StartMatch...")
+    pcall(function()
+        StartMatch:InvokeServer()
+    end)
+
+    isTrainProcessing = false
+end
+
+local function TryChallengeTrain()
+    if not Settings.AutoChallengeTrain then return end
+    joinNextChallenge()
+end
+
+-- แสดงคิวที่จำไว้ตั้งแต่เปิดสคริปต์
+do
+    local savedState = loadTrainState()
+    UpdateTrainUI(savedState.currentPeriod, savedState.nextCarIdx or 1)
+end
+
+-- เมื่อตัวละครเกิดใหม่ (เมื่อจบเกมกลับมา Hub)
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(3.5)
+    TryChallengeTrain()
+end)
+
+-- รันทันทีหากโหลดเข้าเกมมาอยู่แล้ว
+if LocalPlayer.Character then
+    task.spawn(function()
+        task.wait(2.0)
+        TryChallengeTrain()
+    end)
+end
+
+-- ============================================================================
 -- Wish Picker Loop (ตรวจเช็คหน้าต่าง Wish ทุก 0.5 วินาที)
 -- ============================================================================
 task.spawn(function()
@@ -1720,4 +2064,4 @@ task.spawn(function()
     end
 end)
 
-print("[CKD] Macro Ready: Auto Ability + Distributed Upgrade + Wish Priority Picker Loaded with 12s Delay!")
+print("[x2Shift Hub] Ready: Auto Ability + Distributed Upgrade + Wish Priority + Auto Challenge Train")
